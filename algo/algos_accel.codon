@@ -1,0 +1,391 @@
+# Accelerated Codon variants of the classical algorithms (Codon-only source).
+#   codon build -release -o algos_accel algos_accel.codon
+#   ./algos_accel <variant> <N>
+# Output: RESULT,<variant>,<N>,<seconds>,<checksum>
+#
+# Floyd-Warshall variants (int64, same graph/checksum as algos.py):
+#   fw_lists   - baseline: same list-of-lists code as algos.py
+#   fw_flat    - flat Ptr[int] buffer: no bounds checks -> LLVM auto-vectorizes (AVX2)
+#   fw_simd    - explicit simd.Vec[int, 4] (256-bit AVX2 lanes)
+#   fw_par     - fw_flat + @par over rows i (OpenMP, all cores) for each k
+#   fw_par_simd- fw_simd + @par
+#   fw_blocked - cache-blocked (64x64 tiles) Floyd-Warshall, serial
+#   fw_blocked_par - cache-blocked + @par over tiles
+#   fw_gpu     - CUDA kernel per k; matrix stays resident on the GPU
+# N-Queens variants:
+#   nq_serial  - baseline recursion from algos.py
+#   nq_par     - @par over all valid placements of the first two rows (dynamic schedule)
+#   nq_gpu     - one CUDA thread per valid 4-row prefix, iterative DFS with per-thread stack (same as Numba nq_gpu)
+import sys
+import time
+import gpu
+from simd import Vec
+
+INF = 1 << 40
+
+
+def lcg_next(s: int) -> int:
+    return (s * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFFFFFF
+
+
+def make_graph(n: int) -> Ptr[int]:
+    d = Ptr[int](n * n)
+    s = 12345
+    for i in range(n):
+        for j in range(n):
+            s = lcg_next(s)
+            if i == j:
+                d[i * n + j] = 0
+            elif s % 100 < 30:
+                d[i * n + j] = 1 + (s >> 16) % 1000
+            else:
+                d[i * n + j] = INF
+    return d
+
+
+def checksum(d: Ptr[int], n: int) -> int:
+    total = 0
+    for i in range(n * n):
+        if d[i] < INF:
+            total += d[i]
+    return total
+
+
+# ---------------- Floyd-Warshall ----------------
+def fw_lists(n: int) -> int:
+    g = make_graph(n)
+    dist = [[g[i * n + j] for j in range(n)] for i in range(n)]
+    t0 = time.perf_counter()
+    for k in range(n):
+        dk = dist[k]
+        for i in range(n):
+            di = dist[i]
+            dik = di[k]
+            if dik == INF:
+                continue
+            for j in range(n):
+                nd = dik + dk[j]
+                if nd < di[j]:
+                    di[j] = nd
+    dt = time.perf_counter() - t0
+    total = 0
+    for i in range(n):
+        for j in range(n):
+            if dist[i][j] < INF:
+                total += dist[i][j]
+    print_result("fw_lists", n, dt, total)
+    return total
+
+
+def _relax_row(d: Ptr[int], n: int, i: int, k: int):
+    di = d + i * n
+    dk = d + k * n
+    dik = di[k]
+    if dik == INF:
+        return
+    for j in range(n):
+        nd = dik + dk[j]
+        di[j] = nd if nd < di[j] else di[j]
+
+
+def _relax_row_simd(d: Ptr[int], n: int, i: int, k: int):
+    di = d + i * n
+    dk = d + k * n
+    dik = di[k]
+    if dik == INF:
+        return
+    vik = Vec[int, 4](dik)
+    j = 0
+    while j + 4 <= n:
+        cand = Vec[int, 4].load(dk, j) + vik
+        cur = Vec[int, 4].load(di, j)
+        cur.min(cand).store(di, j)
+        j += 4
+    while j < n:
+        nd = dik + dk[j]
+        if nd < di[j]:
+            di[j] = nd
+        j += 1
+
+
+def fw_flat(n: int):
+    d = make_graph(n)
+    t0 = time.perf_counter()
+    for k in range(n):
+        for i in range(n):
+            _relax_row(d, n, i, k)
+    print_result("fw_flat", n, time.perf_counter() - t0, checksum(d, n))
+
+
+def fw_simd(n: int):
+    d = make_graph(n)
+    t0 = time.perf_counter()
+    for k in range(n):
+        for i in range(n):
+            _relax_row_simd(d, n, i, k)
+    print_result("fw_simd", n, time.perf_counter() - t0, checksum(d, n))
+
+
+def fw_par(n: int):
+    d = make_graph(n)
+    t0 = time.perf_counter()
+    for k in range(n):
+        @par(schedule='static')
+        for i in range(n):
+            _relax_row(d, n, i, k)
+    print_result("fw_par", n, time.perf_counter() - t0, checksum(d, n))
+
+
+def fw_par_simd(n: int):
+    d = make_graph(n)
+    t0 = time.perf_counter()
+    for k in range(n):
+        @par(schedule='static')
+        for i in range(n):
+            _relax_row_simd(d, n, i, k)
+    print_result("fw_par_simd", n, time.perf_counter() - t0, checksum(d, n))
+
+
+# Cache-blocked (tiled) Floyd-Warshall: 3 phases per diagonal tile; tiles fit in L1/L2.
+TILE = 64
+
+
+def _tile(d: Ptr[int], n: int, ib: int, jb: int, kb: int):
+    i1 = min(ib + TILE, n)
+    j1 = min(jb + TILE, n)
+    k1 = min(kb + TILE, n)
+    for k in range(kb, k1):
+        dk = d + k * n
+        for i in range(ib, i1):
+            di = d + i * n
+            dik = di[k]
+            if dik == INF:
+                continue
+            for j in range(jb, j1):
+                nd = dik + dk[j]
+                di[j] = nd if nd < di[j] else di[j]
+
+
+def _fw_blocked(d: Ptr[int], n: int, parallel: Literal[bool]):
+    nb = (n + TILE - 1) // TILE
+    for b in range(nb):
+        kb = b * TILE
+        _tile(d, n, kb, kb, kb)  # phase 1: diagonal tile
+        if parallel:
+            @par(schedule='dynamic')
+            for t in range(2 * nb):  # phase 2: row b and column b tiles
+                o = t % nb
+                if o != b:
+                    if t < nb:
+                        _tile(d, n, kb, o * TILE, kb)
+                    else:
+                        _tile(d, n, o * TILE, kb, kb)
+            @par(schedule='dynamic')
+            for t in range(nb * nb):  # phase 3: all other tiles
+                bi = t // nb
+                bj = t % nb
+                if bi != b and bj != b:
+                    _tile(d, n, bi * TILE, bj * TILE, kb)
+        else:
+            for o in range(nb):
+                if o != b:
+                    _tile(d, n, kb, o * TILE, kb)
+                    _tile(d, n, o * TILE, kb, kb)
+            for bi in range(nb):
+                for bj in range(nb):
+                    if bi != b and bj != b:
+                        _tile(d, n, bi * TILE, bj * TILE, kb)
+
+
+def fw_blocked(n: int):
+    d = make_graph(n)
+    t0 = time.perf_counter()
+    _fw_blocked(d, n, False)
+    print_result("fw_blocked", n, time.perf_counter() - t0, checksum(d, n))
+
+
+def fw_blocked_par(n: int):
+    d = make_graph(n)
+    t0 = time.perf_counter()
+    _fw_blocked(d, n, True)
+    print_result("fw_blocked_par", n, time.perf_counter() - t0, checksum(d, n))
+
+
+@gpu.kernel
+def _fw_kernel(d: Ptr[int], n: int, k: int):
+    j = gpu.block.x * gpu.block.dim.x + gpu.thread.x
+    i = gpu.block.y * gpu.block.dim.y + gpu.thread.y
+    if i < n and j < n:
+        dik = d[i * n + k]
+        if dik != INF:
+            nd = dik + d[k * n + j]
+            if nd < d[i * n + j]:
+                d[i * n + j] = nd
+
+
+def fw_gpu(n: int):
+    d = make_graph(n)
+    B = 16
+    G = (n + B - 1) // B
+    # Row k / column k don't change during step k, so in-place update is race-free.
+    t0 = time.perf_counter()  # includes host->device and device->host copies
+    mem = gpu.Memory._alloc(n * n, int)
+    mem._write(d, n * n)
+    dp = Ptr[int](mem.ptr)
+    for k in range(n):
+        _fw_kernel(dp, n, k, grid=(G, G), block=(B, B))
+    mem._read(d, n * n)  # synchronizes
+    dt = time.perf_counter() - t0
+    mem._free()
+    print_result("fw_gpu", n, dt, checksum(d, n))
+
+
+# ---------------- N-Queens ----------------
+def _queens(n: int, row: int, cols: int, d1: int, d2: int) -> int:
+    if row == n:
+        return 1
+    count = 0
+    full = (1 << n) - 1
+    avail = ~(cols | d1 | d2) & full
+    while avail:
+        bit = avail & -avail
+        avail ^= bit
+        count += _queens(n, row + 1, cols | bit, ((d1 | bit) << 1) & full, (d2 | bit) >> 1)
+    return count
+
+
+def nq_serial(n: int):
+    t0 = time.perf_counter()
+    c = _queens(n, 0, 0, 0, 0)
+    print_result("nq_serial", n, time.perf_counter() - t0, c)
+
+
+def nq_par(n: int):
+    full = (1 << n) - 1
+    t0 = time.perf_counter()
+    total = 0
+    @par(schedule='dynamic', chunk_size=1)
+    for c in range(n * n):
+        b0 = 1 << (c // n)
+        b1 = 1 << (c % n)
+        # state after row 0
+        cols = b0
+        d1 = (b0 << 1) & full
+        d2 = b0 >> 1
+        if b1 & (cols | d1 | d2) == 0:
+            total += _queens(n, 2, cols | b1, ((d1 | b1) << 1) & full, (d2 | b1) >> 1)
+    print_result("nq_par", n, time.perf_counter() - t0, total)
+
+
+def _prefixes(n: int, row: int, depth: int, cols: int, d1: int, d2: int, C: List[int], D1: List[int], D2: List[int]):
+    if row == depth:
+        C.append(cols)
+        D1.append(d1)
+        D2.append(d2)
+        return
+    full = (1 << n) - 1
+    avail = ~(cols | d1 | d2) & full
+    while avail:
+        bit = avail & -avail
+        avail ^= bit
+        _prefixes(n, row + 1, depth, cols | bit, ((d1 | bit) << 1) & full, (d2 | bit) >> 1, C, D1, D2)
+
+
+@gpu.kernel
+def _nq_kernel(n: int, start: int, m: int, C: Ptr[int], D1: Ptr[int], D2: Ptr[int], out: Ptr[int]):
+    t = gpu.block.x * gpu.block.dim.x + gpu.thread.x
+    if t < m:
+        full = (1 << n) - 1
+        cs = __array__[int](32)
+        a1 = __array__[int](32)
+        a2 = __array__[int](32)
+        av = __array__[int](32)
+        cs[0] = C[t]
+        a1[0] = D1[t]
+        a2[0] = D2[t]
+        av[0] = ~(C[t] | D1[t] | D2[t]) & full
+        sp = 0
+        count = 0
+        while sp >= 0:
+            a = av[sp]
+            if a == 0:
+                sp -= 1
+                continue
+            bit = a & -a
+            av[sp] = a ^ bit
+            if start + sp + 1 == n:
+                count += 1
+                continue
+            c = cs[sp] | bit
+            x = ((a1[sp] | bit) << 1) & full
+            y = (a2[sp] | bit) >> 1
+            sp += 1
+            cs[sp] = c
+            a1[sp] = x
+            a2[sp] = y
+            av[sp] = ~(c | x | y) & full
+        out[t] = count
+
+
+def nq_gpu(n: int):
+    depth = 4
+    t0 = time.perf_counter()  # includes prefix generation and host<->device copies (as Numba nq_gpu)
+    C, D1, D2 = List[int](), List[int](), List[int]()
+    _prefixes(n, 0, depth, 0, 0, 0, C, D1, D2)
+    m = len(C)
+    mc = gpu.Memory._alloc(m, int)
+    m1 = gpu.Memory._alloc(m, int)
+    m2 = gpu.Memory._alloc(m, int)
+    mo = gpu.Memory._alloc(m, int)
+    mc._write(C._ptr, m)
+    m1._write(D1._ptr, m)
+    m2._write(D2._ptr, m)
+    T = 128
+    _nq_kernel(n, depth, m, Ptr[int](mc.ptr), Ptr[int](m1.ptr), Ptr[int](m2.ptr), Ptr[int](mo.ptr),
+               grid=(m + T - 1) // T, block=T)
+    res = Ptr[int](m)
+    mo._read(res, m)
+    total = 0
+    for i in range(m):
+        total += res[i]
+    dt = time.perf_counter() - t0
+    for mem in (mc, m1, m2, mo):
+        mem._free()
+    print_result("nq_gpu", n, dt, total)
+
+
+def print_result(name: str, n: int, dt: float, chk: int):
+    print(f"RESULT,{name},{n},{dt:.6f},{chk}")
+
+
+def main():
+    v = sys.argv[1]
+    n = int(sys.argv[2])
+    if v == "fw_lists":
+        fw_lists(n)
+    elif v == "fw_flat":
+        fw_flat(n)
+    elif v == "fw_simd":
+        fw_simd(n)
+    elif v == "fw_par":
+        fw_par(n)
+    elif v == "fw_par_simd":
+        fw_par_simd(n)
+    elif v == "fw_blocked":
+        fw_blocked(n)
+    elif v == "fw_blocked_par":
+        fw_blocked_par(n)
+    elif v == "fw_gpu":
+        fw_gpu(n)
+    elif v == "nq_serial":
+        nq_serial(n)
+    elif v == "nq_par":
+        nq_par(n)
+    elif v == "nq_gpu":
+        nq_gpu(n)
+    else:
+        print("unknown variant " + v)
+        sys.exit(1)
+
+
+main()

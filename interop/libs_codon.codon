@@ -1,0 +1,147 @@
+# Codon -> Python libraries via `from python import`, same loops as libs_py.py.
+# Modes:
+#   conv          native Codon args converted to Python objects on every call
+#   pre           args pre-converted once to pyobj (only the call + result conversion is timed)
+#   conv_bigheap  like conv, but with 3M live Codon strings on the GC heap (shows GC-scan cost)
+# Usage: libs_codon <case> <mode> <K>     Output: RESULT,<case>,<K>,<seconds>,<checksum>
+import sys, time
+from python import numpy as pynp
+from python import pandas as pd
+from python import polars as pl
+from python import json as pyjson
+from python import orjson
+from python import re as pyre
+
+P = 1000
+
+
+def pool_floats():
+    return [float(i) + 0.5 for i in range(P)]
+
+
+def pool_ints():
+    return [(i * 7919) % P for i in range(P)]
+
+
+def pool_dates():
+    return [f"2024-{1 + i % 12:02d}-{1 + i % 28:02d} {i % 24:02d}:{i % 60:02d}:{(i * 7) % 60:02d}" for i in range(P)]
+
+
+def pool_json():
+    return ['{"a": ' + str(i) + ', "b": [1, 2, 3], "c": "x' + str(i) + '"}' for i in range(P)]
+
+
+def pool_text():
+    return [f"id {i} qty {i * 3 % 97} ref {i * 7919 % 100003} end" for i in range(P)]
+
+
+def pool_vecs():
+    return [[float((i * 31 + j) % 17) for j in range(8)] for i in range(P)]
+
+
+def to_py(x) -> pyobj:
+    return pyobj(x.__to_py__(), steal=True)
+
+
+def c_np_sqrt(k: int, xs):
+    f = pynp.sqrt
+    tot = 0
+    t0 = time.perf_counter()
+    for i in range(k):
+        tot += int(float(f(xs[i % P])) * 1000)
+    return time.perf_counter() - t0, tot
+
+
+def c_np_dot(k: int):
+    f = pynp.dot
+    vs = VS
+    tot = 0
+    t0 = time.perf_counter()
+    for i in range(k):
+        tot += int(float(f(vs[i % P], vs[(i + 1) % P])))
+    return time.perf_counter() - t0, tot
+
+
+def c_pd_timestamp(k: int, ds):
+    f = pd.Timestamp
+    tot = 0
+    t0 = time.perf_counter()
+    for i in range(k):
+        tot += int(f(ds[i % P]).value) // 1_000_000_000
+    return time.perf_counter() - t0, tot
+
+
+def c_pl_getitem(k: int, idx):
+    s = pl.Series("v", pool_ints())
+    tot = 0
+    t0 = time.perf_counter()
+    for i in range(k):
+        tot += int(s[idx[i % P]])
+    return time.perf_counter() - t0, tot
+
+
+def c_loads(k: int, f, js, key):
+    tot = 0
+    t0 = time.perf_counter()
+    for i in range(k):
+        tot += int(f(js[i % P])[key])
+    return time.perf_counter() - t0, tot
+
+
+def c_re_findall(k: int, ts):
+    f = pyre.compile(r"\d+").findall
+    tot = 0
+    t0 = time.perf_counter()
+    for i in range(k):
+        tot += len(f(ts[i % P]))
+    return time.perf_counter() - t0, tot
+
+
+# Pools are module globals on purpose: in -release builds, when a pool list was only a local
+# passed into the loop function, the Boehm GC freed it mid-loop (wrong results / segfaults
+# after the first collection). Globals are always GC roots.
+FL = pool_floats()
+DTS = pool_dates()
+IX = pool_ints()
+JS = pool_json()
+TX = pool_text()
+PFL = [to_py(x) for x in FL]
+PDTS = [to_py(x) for x in DTS]
+PIX = [to_py(x) for x in IX]
+PJS = [to_py(x) for x in JS]
+PTX = [to_py(x) for x in TX]
+PKEY = to_py("a")
+VS = [pynp.array(v) for v in pool_vecs()]  # numpy arrays only exist on the Python side
+
+
+def run(case: str, pre: bool, k: int):
+    if case == "np_sqrt":
+        return c_np_sqrt(k, PFL) if pre else c_np_sqrt(k, FL)
+    if case == "np_dot":
+        return c_np_dot(k)
+    if case == "pd_timestamp":
+        return c_pd_timestamp(k, PDTS) if pre else c_pd_timestamp(k, DTS)
+    if case == "pl_getitem":
+        return c_pl_getitem(k, PIX) if pre else c_pl_getitem(k, IX)
+    if case == "json_loads" or case == "orjson_loads":
+        f = pyjson.loads if case == "json_loads" else orjson.loads
+        return c_loads(k, f, PJS, PKEY) if pre else c_loads(k, f, JS, "a")
+    if case == "re_findall":
+        return c_re_findall(k, PTX) if pre else c_re_findall(k, TX)
+    print("unknown case " + case)
+    sys.exit(1)
+    return 0.0, 0
+
+
+def main():
+    case, mode, k = sys.argv[1], sys.argv[2], int(sys.argv[3])
+    heap = List[str]()
+    if mode == "conv_bigheap":
+        heap = ["live-object-" + str(i) for i in range(3_000_000)]
+    dt, tot = run(case, mode == "pre", k)
+    if len(heap) == 1:  # keep heap alive
+        print(heap[0])
+    print(f"RESULT,{case},{k},{dt:.6f},{tot}")
+
+
+main()

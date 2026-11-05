@@ -1,0 +1,52 @@
+[geo] built geo_same in 5.6s
+[geo] built geo_codon in 11.7s
+[geo] pip_naive       n=100000     python:shapely_loop        0.6006s  chk=21153010503202
+[geo] pip_naive       n=100000     python:pure                0.6012s  chk=21153010503202
+[geo] pip_naive       n=100000     python:shapely_union_loop     0.2891s  chk=21153010503202
+[geo] pip_naive       n=100000     python:shapely_vec         0.0913s  chk=21153010503202
+[geo] pip_naive       n=100000     python:shapely_strtree     0.0685s  chk=21153010503202
+[geo] pip_naive       n=100000     codon:pure                 0.0410s  chk=21153010503202
+[geo] pip_naive       n=100000     codon:geos                 0.0436s  chk=21153010503202
+[geo] pip_naive       n=100000     codon:geos_par             0.0146s  chk=21153010503202
+[geo] pip_naive       n=100000     codon:pure_par             0.0096s  chk=21153010503202
+[geo] pip_naive       n=100000     codon:gpu                  0.0023s  chk=21153010503202
+[geo] pip_naive       n=1000000    python:shapely_loop        5.9526s  chk=211595105466423
+[geo] pip_naive       n=1000000    python:pure                5.9462s  chk=211595105466423
+[geo] pip_naive       n=1000000    python:shapely_union_loop     2.4540s  chk=211595105466423
+[geo] pip_naive       n=1000000    python:shapely_vec         0.5515s  chk=211595105466423
+[geo] pip_naive       n=1000000    python:shapely_strtree     0.6405s  chk=211595105466423
+[geo] pip_naive       n=1000000    codon:pure                 0.3474s  chk=211595105466423
+[geo] pip_naive       n=1000000    codon:geos                 0.4214s  chk=211595105466423
+[geo] pip_naive       n=1000000    codon:geos_par             0.0538s  chk=211595105466423
+[geo] pip_naive       n=1000000    codon:pure_par             0.0510s  chk=211595105466423
+[geo] pip_naive       n=1000000    codon:gpu                  0.0187s  chk=211595105466423
+[geo] pip_naive       n=3000000    python:shapely_loop       17.8030s  chk=634251316005729
+[geo] pip_naive       n=3000000    python:pure               17.8928s  chk=634251316005729
+[geo] pip_naive       n=3000000    python:shapely_union_loop     7.3071s  chk=634251316005729
+[geo] pip_naive       n=3000000    python:shapely_vec         1.5846s  chk=634251316005729
+[geo] pip_naive       n=3000000    python:shapely_strtree     1.9098s  chk=634251316005729
+[geo] pip_naive       n=3000000    codon:pure                 0.9878s  chk=634251316005729
+[geo] pip_naive       n=3000000    codon:geos                 1.2320s  chk=634251316005729
+[geo] pip_naive       n=3000000    codon:geos_par             0.1345s  chk=634251316005729
+[geo] pip_naive       n=3000000    codon:pure_par             0.1413s  chk=634251316005729
+[geo] pip_naive       n=3000000    codon:gpu                  0.0546s  chk=634251316005729
+[geo] pip_grid        n=100000     python:shapely_grid        0.1593s  chk=21153010503202
+[geo] pip_grid        n=100000     python:pure_grid           0.1510s  chk=21153010503202
+[geo] pip_grid        n=100000     codon:pure_grid            0.0218s  chk=21153010503202
+[geo] pip_grid        n=100000     codon:geos_grid            0.0175s  chk=21153010503202
+[geo] pip_grid        n=100000     codon:grid_par             0.0047s  chk=21153010503202
+[geo] pip_grid        n=100000     codon:grid_gpu             0.0029s  chk=21153010503202
+[geo] pip_grid        n=1000000    python:shapely_grid        1.3116s  chk=211595105466423
+[geo] pip_grid        n=1000000    python:pure_grid           1.2080s  chk=211595105466423
+[geo] pip_grid        n=1000000    codon:pure_grid            0.0763s  chk=211595105466423
+[geo] pip_grid        n=1000000    codon:geos_grid            0.0739s  chk=211595105466423
+[geo] pip_grid        n=1000000    codon:grid_par             0.0114s  chk=211595105466423
+[geo] pip_grid        n=1000000    codon:grid_gpu             0.0090s  chk=211595105466423
+[geo] pip_grid        n=3000000    python:shapely_grid        3.7103s  chk=634251316005729
+[geo] pip_grid        n=3000000    python:pure_grid           3.5476s  chk=634251316005729
+[geo] pip_grid        n=3000000    codon:pure_grid            0.1829s  chk=634251316005729
+[geo] pip_grid        n=3000000    codon:geos_grid            0.2043s  chk=634251316005729
+[geo] pip_grid        n=3000000    codon:grid_par             0.0204s  chk=634251316005729
+[geo] pip_grid        n=3000000    codon:grid_gpu             0.0214s  chk=634251316005729
+
+wrote /home/dekelco/views/codon_eval/research/results/RESULTS.md

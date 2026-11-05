@@ -1,0 +1,123 @@
+# Codon side of the numeric / dataframe benchmarks.
+#   codon build -release -o bench_codon bench_codon.codon
+#   ./bench_codon <bench> <impl> <N>
+# bench: numpy_vec | numpy_loop | groupby
+# impl : native      -> Codon-NumPy / pure compiled Codon code
+#        native_par  -> compiled Codon with @par (OpenMP) multithreading
+#        polars      -> Polars (Rust) called from Codon via Python interop (groupby only)
+# Output: RESULT,<bench>,<impl>,<N>,<seconds>,<checksum>
+import sys
+import time
+import numpy as np
+import numpy.pybridge  # enables ndarray <-> Python (numpy) transfer
+from python import polars as pl
+
+
+def make_data(n: int):
+    i = np.arange(n, dtype=np.int64)
+    x = (i * 0.6180339887498949) % 1.0
+    k = (i * 2654435761) % 1000
+    return x, k
+
+
+# ---------------- numpy_vec ----------------
+def vec_native(x: np.ndarray[float, 1], k: np.ndarray[int, 1]) -> float:
+    return float((np.sin(x) * np.exp(-x) + np.sqrt(x)).sum())
+
+
+def vec_native_par(x: np.ndarray[float, 1], k: np.ndarray[int, 1]) -> float:
+    s = 0.0
+    n = x.shape[0]
+    @par(schedule='static')
+    for i in range(n):
+        v = x[i]
+        s += np.sin(v) * np.exp(-v) + np.sqrt(v)
+    return s
+
+
+# ---------------- numpy_loop ----------------
+def loop_native(x: np.ndarray[float, 1], k: np.ndarray[int, 1]) -> float:
+    ema = 0.0
+    hits = 0
+    for i in range(x.shape[0]):
+        ema = 0.7 * ema + 0.3 * x[i]
+        if ema > 0.55:
+            hits += 1
+            ema *= 0.5
+    return hits + ema
+
+
+# ---------------- groupby ----------------
+def gb_native(x: np.ndarray[float, 1], k: np.ndarray[int, 1]) -> float:
+    # Hash-based groupby (general keys), like a dataframe engine would do.
+    slot = dict[int, int]()
+    sums = list[float]()
+    cnts = list[int]()
+    mxs = list[float]()
+    for i in range(x.shape[0]):
+        key = k[i]
+        v = x[i]
+        s = slot.get(key, -1)
+        if s < 0:
+            s = len(sums)
+            slot[key] = s
+            sums.append(0.0)
+            cnts.append(0)
+            mxs.append(v)
+        sums[s] += v
+        cnts[s] += 1
+        if v > mxs[s]:
+            mxs[s] = v
+    chk = 0.0
+    for s in range(len(sums)):
+        chk += sums[s] / cnts[s] + mxs[s] + cnts[s]
+    return chk
+
+
+def gb_polars(x: np.ndarray[float, 1], k: np.ndarray[int, 1]) -> float:
+    df = pl.DataFrame([pl.Series("k", k), pl.Series("v", x)])
+    g = df.group_by("k").agg(
+        pl.col("v").sum().alias("s"),
+        pl.col("v").mean().alias("m"),
+        pl.len().alias("c"),
+        pl.col("v").max().alias("mx"),
+    )
+    return float(g["m"].sum()) + float(g["mx"].sum()) + float(g["c"].sum())
+
+
+def run(fn, x, k, warmup: bool = False):
+    # Native Codon code is AOT-compiled: no warmup needed, and timing the same
+    # pure call repeatedly in-process lets LLVM CSE the repeats away (0s timings).
+    # So native impls are timed ONCE per process; the runner repeats processes.
+    # Polars calls are opaque Python calls, so a warmup (thread pool init) is safe.
+    if warmup:
+        fn(x, k)
+    t0 = time.perf_counter()
+    chk = fn(x, k)
+    return time.perf_counter() - t0, chk
+
+
+def main():
+    bench = sys.argv[1]
+    impl = sys.argv[2]
+    n = int(sys.argv[3])
+    x, k = make_data(n)
+    best = 0.0
+    chk = 0.0
+    if bench == "numpy_vec" and impl == "native":
+        best, chk = run(vec_native, x, k)
+    elif bench == "numpy_vec" and impl == "native_par":
+        best, chk = run(vec_native_par, x, k)
+    elif bench == "numpy_loop" and impl == "native":
+        best, chk = run(loop_native, x, k)
+    elif bench == "groupby" and impl == "native":
+        best, chk = run(gb_native, x, k)
+    elif bench == "groupby" and impl == "polars":
+        best, chk = run(gb_polars, x, k, warmup=True)
+    else:
+        print(f"unsupported combo {bench}/{impl}")
+        sys.exit(1)
+    print(f"RESULT,{bench},{impl},{n},{best:.6f},{chk:.4f}")
+
+
+main()

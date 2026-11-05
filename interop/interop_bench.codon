@@ -1,0 +1,127 @@
+# How expensive is calling a Python C-extension (rapidfuzz) from Codon in a tight loop?
+#   g++ -O3 -march=native -std=c++17 -shared -fPIC -I$CONDA_PREFIX/include -o librf_shim.so rf_shim.cpp
+#   codon build -release -l rf_shim --linker-flags="-L. -Wl,-rpath,\$ORIGIN" -o interop_codon interop_bench.codon
+#   ./interop_codon <impl> <M>         (M = number of string pairs)
+# impl:
+#   py_loop      - from python import rapidfuzz; call Levenshtein.distance(a, b) per pair
+#                  (each call: 2x str->PyUnicode copy, PyObject_Call, int unboxing, decref)
+#   py_preconv   - same, but strings converted to Python objects once before the timed loop
+#   py_noop      - per-pair call of Python's builtin len(a): pure interop overhead, no real work
+#   py_cpdist    - ONE batched call: rapidfuzz.process.cpdist(A, B, workers=-1) via interop
+#   c_shim       - from C import rf_lev: direct native call into rapidfuzz-cpp (no Python at all)
+#   c_shim_par   - c_shim + @par over pairs (all cores)
+#   native_dp    - plain Codon O(L^2) Levenshtein DP (no library)
+# Output: RESULT,<impl>,<M>,<seconds>,<checksum>
+import sys
+import time
+from python import rapidfuzz
+from python import builtins
+
+from C import rf_lev(cobj, int, cobj, int) -> int
+
+L = 32
+
+
+def lcg_next(s: int) -> int:
+    return (s * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFFFFFF
+
+
+def gen_pairs(m: int):
+    A = list[str](m)
+    B = list[str](m)
+    s = 4242
+    for _ in range(m):
+        a = []
+        b = []
+        for i in range(L):
+            s = lcg_next(s)
+            c = "acgt"[(s >> 20) % 4]
+            a.append(c)
+            r = (s >> 30) % 10
+            if r == 0:
+                b.append("acgt"[(s >> 34) % 4])  # substitution
+            elif r == 1:
+                b.append(c + c)  # insertion
+            elif r != 2:  # r == 2 -> deletion
+                b.append(c)
+        A.append("".join(a))
+        B.append("".join(b))
+    return A, B
+
+
+def native_dp(a: str, b: str) -> int:
+    n = len(a)
+    m = len(b)
+    prev = Ptr[int](m + 1)
+    cur = Ptr[int](m + 1)
+    for j in range(m + 1):
+        prev[j] = j
+    for i in range(1, n + 1):
+        cur[0] = i
+        ai = a._ptr[i - 1]
+        for j in range(1, m + 1):
+            x = prev[j] + 1
+            y = cur[j - 1] + 1
+            z = prev[j - 1] + (0 if ai == b._ptr[j - 1] else 1)
+            if y < x:
+                x = y
+            if z < x:
+                x = z
+            cur[j] = x
+        prev, cur = cur, prev
+    return prev[m]
+
+
+def main():
+    impl = sys.argv[1]
+    m = int(sys.argv[2])
+    A, B = gen_pairs(m)
+    dist = rapidfuzz.distance.Levenshtein.distance  # attribute lookup hoisted out of the loop
+    total = 0
+
+    if impl == "py_loop":
+        t0 = time.perf_counter()
+        for i in range(m):
+            total += int(dist(A[i], B[i]))
+        dt = time.perf_counter() - t0
+    elif impl == "py_preconv":
+        PA = [pyobj(a.__to_py__(), steal=True) for a in A]
+        PB = [pyobj(b.__to_py__(), steal=True) for b in B]
+        t0 = time.perf_counter()
+        for i in range(m):
+            total += int(dist(PA[i], PB[i]))
+        dt = time.perf_counter() - t0
+    elif impl == "py_noop":
+        pylen = builtins.len
+        t0 = time.perf_counter()
+        for i in range(m):
+            total += int(pylen(A[i]))
+        dt = time.perf_counter() - t0
+    elif impl == "py_cpdist":
+        cpdist = rapidfuzz.process.cpdist
+        t0 = time.perf_counter()  # includes converting both lists to Python
+        total = int(cpdist(A, B, scorer=dist, workers=-1).sum())
+        dt = time.perf_counter() - t0
+    elif impl == "c_shim":
+        t0 = time.perf_counter()
+        for i in range(m):
+            total += rf_lev(A[i]._ptr, len(A[i]), B[i]._ptr, len(B[i]))
+        dt = time.perf_counter() - t0
+    elif impl == "c_shim_par":
+        t0 = time.perf_counter()
+        @par(schedule='static', chunk_size=1024)
+        for i in range(m):
+            total += rf_lev(A[i]._ptr, len(A[i]), B[i]._ptr, len(B[i]))
+        dt = time.perf_counter() - t0
+    elif impl == "native_dp":
+        t0 = time.perf_counter()
+        for i in range(m):
+            total += native_dp(A[i], B[i])
+        dt = time.perf_counter() - t0
+    else:
+        print("unknown impl " + impl)
+        sys.exit(1)
+    print(f"RESULT,{impl},{m},{dt:.6f},{total}")
+
+
+main()

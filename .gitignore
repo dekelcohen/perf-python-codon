@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.so
+# compiled Codon binaries
+algo/algos_codon
+algo/algos_accel
+algo/algos_accel_generic
+dataframe/bench_codon
+text/text_codon
+interop/interop_codon
+interop/libs_codon
+geo/geo_same
+geo/geo_codon

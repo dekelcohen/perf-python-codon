@@ -1,0 +1,224 @@
+# Codon variants of the point-in-polygon benchmark (data, ray casting and grid from geo_bench.py).
+#   codon build -release -l geos_c --linker-flags="-L$CONDA_PREFIX/lib -Wl,-rpath,$CONDA_PREFIX/lib" \
+#         --libdevice=$CODON_LIBDEVICE -o geo_codon geo_codon.codon
+#   ./geo_codon <variant> <N>      Output: RESULT,<variant>,<N>,<seconds>,<checksum>
+# naive (bbox prefilter, no spatial index):
+#   geos       - GEOS C API directly (`from C import`, GEOSPreparedContainsXY_r) - the C library shapely wraps
+#   geos_par   - geos + @par (per-thread GEOS context and per-thread prepared polygons)
+#   pure       - native ray casting (= geo_bench.count_naive)
+#   pure_par   - native + @par
+#   gpu        - native ray casting in a CUDA kernel, one thread per point
+# grid (same grid index as geo_bench.py):
+#   geos_grid  - grid lookup + GEOS exact test for candidates
+#   grid_par   - grid + native ray casting + @par
+#   grid_gpu   - grid + native ray casting on the GPU
+# Timed region = everything after raw coordinate generation (GEOS geometry build/prepare, grid build, GPU copies).
+import sys
+import time
+import gpu
+import openmp as omp
+from geo_bench import gen_polygons, gen_points, pip, checksum, build_grid, cell_of, count_naive, count_grid, G, W
+
+from C import GEOS_init_r() -> cobj
+from C import GEOSCoordSeq_create_r(cobj, u32, u32) -> cobj
+from C import GEOSCoordSeq_setXY_r(cobj, cobj, u32, float, float) -> i32
+from C import GEOSGeom_createLinearRing_r(cobj, cobj) -> cobj
+from C import GEOSGeom_createPolygon_r(cobj, cobj, cobj, u32) -> cobj
+from C import GEOSPrepare_r(cobj, cobj) -> cobj
+from C import GEOSPreparedContainsXY_r(cobj, cobj, float, float) -> i8
+
+
+def geos_prepared(ctx: cobj, px: List[float], py: List[float], off: List[int]) -> List[cobj]:
+    out = List[cobj]()
+    for p in range(len(off) - 1):
+        a = off[p]
+        b = off[p + 1]
+        seq = GEOSCoordSeq_create_r(ctx, u32(b - a + 1), u32(2))
+        for i in range(a, b):
+            GEOSCoordSeq_setXY_r(ctx, seq, u32(i - a), px[i], py[i])
+        GEOSCoordSeq_setXY_r(ctx, seq, u32(b - a), px[a], py[a])  # close the ring
+        ring = GEOSGeom_createLinearRing_r(ctx, seq)
+        pg = GEOSPrepare_r(ctx, GEOSGeom_createPolygon_r(ctx, ring, cobj(), u32(0)))
+        GEOSPreparedContainsXY_r(ctx, pg, -1.0, -1.0)  # build the lazy point-in-area index now (thread safety)
+        out.append(pg)
+    return out
+
+
+def contexts() -> List[cobj]:
+    return [GEOS_init_r() for _ in range(omp.get_max_threads())]
+
+
+def geos_naive(ctxs: List[cobj], preps: List[List[cobj]], bx0, by0, bx1, by1, xs, ys, flags: List[int],
+               parallel: Literal[bool]):
+    # preps[t] = thread t's own prepared polygons: sharing one set across threads crashed GEOS (double free)
+    P = len(preps[0])
+    if parallel:
+        @par(schedule='dynamic', chunk_size=4096)
+        for i in range(len(xs)):
+            t = omp.get_thread_num()
+            ctx = ctxs[t]
+            prep = preps[t]
+            x = xs[i]
+            y = ys[i]
+            for p in range(P):
+                if bx0[p] <= x <= bx1[p] and by0[p] <= y <= by1[p] and GEOSPreparedContainsXY_r(ctx, prep[p], x, y) == i8(1):
+                    flags[i] = 1
+                    break
+    else:
+        ctx = ctxs[0]
+        prep = preps[0]
+        for i in range(len(xs)):
+            x = xs[i]
+            y = ys[i]
+            for p in range(P):
+                if bx0[p] <= x <= bx1[p] and by0[p] <= y <= by1[p] and GEOSPreparedContainsXY_r(ctx, prep[p], x, y) == i8(1):
+                    flags[i] = 1
+                    break
+
+
+def pure_naive_par(px, py, off, bx0, by0, bx1, by1, xs, ys, flags: List[int]):
+    P = len(off) - 1
+    @par(schedule='dynamic', chunk_size=4096)
+    for i in range(len(xs)):
+        x = xs[i]
+        y = ys[i]
+        for p in range(P):
+            if bx0[p] <= x <= bx1[p] and by0[p] <= y <= by1[p] and pip(px, py, off[p], off[p + 1], x, y):
+                flags[i] = 1
+                break
+
+
+def geos_grid(ctx: cobj, prep: List[cobj], full, coff, cand, bx0, by0, bx1, by1, xs, ys, flags: List[int]):
+    for i in range(len(xs)):
+        x = xs[i]
+        y = ys[i]
+        c = cell_of(x, y)
+        if full[c]:
+            flags[i] = 1
+            continue
+        for k in range(coff[c], coff[c + 1]):
+            p = cand[k]
+            if bx0[p] <= x <= bx1[p] and by0[p] <= y <= by1[p] and GEOSPreparedContainsXY_r(ctx, prep[p], x, y) == i8(1):
+                flags[i] = 1
+                break
+
+
+def grid_par(px, py, off, bx0, by0, bx1, by1, xs, ys, flags: List[int]):
+    full, coff, cand = build_grid(px, py, off, bx0, by0, bx1, by1)
+    @par(schedule='dynamic', chunk_size=4096)
+    for i in range(len(xs)):
+        x = xs[i]
+        y = ys[i]
+        c = cell_of(x, y)
+        if full[c]:
+            flags[i] = 1
+        else:
+            for k in range(coff[c], coff[c + 1]):
+                p = cand[k]
+                if bx0[p] <= x <= bx1[p] and by0[p] <= y <= by1[p] and pip(px, py, off[p], off[p + 1], x, y):
+                    flags[i] = 1
+                    break
+
+
+# ---------------- GPU ----------------
+@gpu.kernel
+def k_naive(n: int, P: int, px: Ptr[float], py: Ptr[float], off: Ptr[int], bx0: Ptr[float], by0: Ptr[float],
+            bx1: Ptr[float], by1: Ptr[float], xs: Ptr[float], ys: Ptr[float], flags: Ptr[int]):
+    i = gpu.block.x * gpu.block.dim.x + gpu.thread.x
+    if i < n:
+        x = xs[i]
+        y = ys[i]
+        r = 0
+        for p in range(P):
+            if bx0[p] <= x <= bx1[p] and by0[p] <= y <= by1[p] and pip(px, py, off[p], off[p + 1], x, y):
+                r = 1
+                break
+        flags[i] = r
+
+
+@gpu.kernel
+def k_grid(n: int, px: Ptr[float], py: Ptr[float], off: Ptr[int], bx0: Ptr[float], by0: Ptr[float],
+           bx1: Ptr[float], by1: Ptr[float], full: Ptr[int], coff: Ptr[int], cand: Ptr[int],
+           xs: Ptr[float], ys: Ptr[float], flags: Ptr[int]):
+    i = gpu.block.x * gpu.block.dim.x + gpu.thread.x
+    if i < n:
+        x = xs[i]
+        y = ys[i]
+        inv = G / W
+        c = min(int(y * inv), G - 1) * G + min(int(x * inv), G - 1)
+        r = full[c]
+        if r == 0:
+            for k in range(coff[c], coff[c + 1]):
+                p = cand[k]
+                if bx0[p] <= x <= bx1[p] and by0[p] <= y <= by1[p] and pip(px, py, off[p], off[p + 1], x, y):
+                    r = 1
+                    break
+        flags[i] = r
+
+
+def up(l: List[T], T: type) -> Ptr[T]:
+    # device copy; buffers live until process exit (one-shot benchmark)
+    m = gpu.Memory._alloc(len(l), T)
+    m._write(l._ptr, len(l))
+    return Ptr[T](m.ptr)
+
+
+def run_gpu(grid: bool, px, py, off, bx0, by0, bx1, by1, xs, ys, flags: List[int]):
+    n = len(xs)
+    dpx, dpy, doff = up(px), up(py), up(off)
+    dbx0, dby0, dbx1, dby1 = up(bx0), up(by0), up(bx1), up(by1)
+    dxs, dys = up(xs), up(ys)
+    mflags = gpu.Memory._alloc(n, int)
+    dfl = Ptr[int](mflags.ptr)
+    T = 256
+    B = (n + T - 1) // T
+    if grid:
+        full, coff, cand = build_grid(px, py, off, bx0, by0, bx1, by1)
+        k_grid(n, dpx, dpy, doff, dbx0, dby0, dbx1, dby1, up(full), up(coff), up(cand), dxs, dys, dfl,
+               grid=B, block=T)
+    else:
+        k_naive(n, len(off) - 1, dpx, dpy, doff, dbx0, dby0, dbx1, dby1, dxs, dys, dfl, grid=B, block=T)
+    mflags._read(flags._ptr, n)  # synchronizes
+    mflags._free()
+
+
+def main():
+    v = sys.argv[1]
+    n = int(sys.argv[2])
+    px, py, off, bx0, by0, bx1, by1 = gen_polygons()
+    xs, ys = gen_points(n)
+    flags = [0] * n
+    if v == "gpu" or v == "grid_gpu":
+        run_gpu(False, px, py, off, bx0, by0, bx1, by1, xs[:1], ys[:1], [0])  # CUDA context init / module load
+    t0 = time.perf_counter()
+    if v == "geos" or v == "geos_par" or v == "geos_grid":
+        ctxs = contexts()
+        prep = geos_prepared(ctxs[0], px, py, off)
+        if v == "geos":
+            geos_naive(ctxs, [prep], bx0, by0, bx1, by1, xs, ys, flags, False)
+        elif v == "geos_par":
+            preps = [prep] + [geos_prepared(ctxs[t], px, py, off) for t in range(1, len(ctxs))]
+            geos_naive(ctxs, preps, bx0, by0, bx1, by1, xs, ys, flags, True)
+        else:
+            full, coff, cand = build_grid(px, py, off, bx0, by0, bx1, by1)
+            geos_grid(ctxs[0], prep, full, coff, cand, bx0, by0, bx1, by1, xs, ys, flags)
+    elif v == "pure":
+        flags = count_naive(px, py, off, bx0, by0, bx1, by1, xs, ys)
+    elif v == "pure_par":
+        pure_naive_par(px, py, off, bx0, by0, bx1, by1, xs, ys, flags)
+    elif v == "gpu":
+        run_gpu(False, px, py, off, bx0, by0, bx1, by1, xs, ys, flags)
+    elif v == "grid":
+        flags = count_grid(px, py, off, bx0, by0, bx1, by1, xs, ys)
+    elif v == "grid_par":
+        grid_par(px, py, off, bx0, by0, bx1, by1, xs, ys, flags)
+    elif v == "grid_gpu":
+        run_gpu(True, px, py, off, bx0, by0, bx1, by1, xs, ys, flags)
+    else:
+        print("unknown variant " + v)
+        sys.exit(1)
+    dt = time.perf_counter() - t0
+    print(f"RESULT,{v},{n},{dt:.6f},{checksum(flags)}")
+
+
+main()
