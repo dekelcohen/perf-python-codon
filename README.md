@@ -1,5 +1,7 @@
 # Codon vs Python — runtime research
-
+* TODO: Measure C++/C
+* TODO: Measure Memory + operate in Batches
+* TODO: 
 Compares [Codon](https://github.com/exaloop/codon) (AOT Python-subset compiler, LLVM) with CPython on
 (1) classical CPU-heavy algorithms, (2) accelerating them in Codon with SIMD / multithreading / GPU,
 (3) NumPy / dataframe-style workloads, (4) text / strings / regex and (5–6) the cost of calling Python
